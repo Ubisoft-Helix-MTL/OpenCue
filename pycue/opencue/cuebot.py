@@ -151,6 +151,7 @@ class Cuebot(object):
         :param config: config dictionary, this will override the config read from disk
         """
         hosts_env = os.getenv("CUEBOT_HOSTS")
+        print("Hosts Env:", hosts_env)
 
         if config:
             Cuebot.Config = config
