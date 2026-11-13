@@ -35,6 +35,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 
@@ -89,6 +90,10 @@ class Machine(object):
             self.__vmstat = rqd.rqswap.VmStat()
 
         self.state = opencue_proto.host_pb2.UP
+
+        self.__windowsLoadLock = threading.Lock()
+        self.__windowsLoadSample = None
+        self.__windowsCpuTimes = None
 
         self.__renderHost = opencue_proto.report_pb2.RenderHost()
         self.__initMachineTags()
@@ -465,7 +470,50 @@ class Machine(object):
                 loadAvg = loadAvg + rqd.rqconstants.LOAD_MODIFIER
                 loadAvg = max(loadAvg, 0)
                 return loadAvg
+        if platform.system() == "Windows":
+            return self._getLoadAvgWindows()
         return 0
+
+    def _getLoadAvgWindows(self):
+        """Returns the cpu busy on Windows, in the unit of the Linux load: busy cores times 100.
+
+        Windows has no load average. The figure is the mean cpu use since the previous reading,
+        from cpu times kept here because psutil.cpu_percent keeps its state per thread and host
+        reports come from new threads. The first reading covers the time since boot. A reading
+        is reused for RQD_MIN_PING_INTERVAL_SEC so reports close together do not measure
+        nothing. Returns 0 when the cpu cannot be read.
+        """
+        with self.__windowsLoadLock:
+            sample = self.__windowsLoadSample
+            now = time.monotonic()
+            if sample and now - sample[0] < rqd.rqconstants.RQD_MIN_PING_INTERVAL_SEC:
+                return sample[1]
+            try:
+                loadAvg = self.__readWindowsLoad()
+            except (OSError, ValueError, ZeroDivisionError, TypeError, psutil.Error) as e:
+                log.warning("Failed to read the cpu load: %s", e)
+                return 0
+            self.__windowsLoadSample = (now, loadAvg)
+            return loadAvg
+
+    def __busyShareSincePreviousReading(self):
+        times = psutil.cpu_times()
+        busy = sum(times) - times.idle
+        total = sum(times)
+        if self.__windowsCpuTimes:
+            busy -= sum(self.__windowsCpuTimes) - self.__windowsCpuTimes.idle
+            total -= sum(self.__windowsCpuTimes)
+        self.__windowsCpuTimes = times
+        if total <= 0:
+            return 0.0
+        return busy / total
+
+    def __readWindowsLoad(self):
+        busyShare = self.__busyShareSincePreviousReading()
+        loadAvg = int(busyShare * psutil.cpu_count(logical=True) * 100)
+        if self.__enabledHT():
+            loadAvg = loadAvg // self.getHyperthreadingMultiplier()
+        return max(loadAvg + rqd.rqconstants.LOAD_MODIFIER, 0)
 
     @rqd.rqutil.Memoize
     def getBootTime(self):

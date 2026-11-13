@@ -21,10 +21,13 @@ from __future__ import print_function
 from __future__ import division
 from __future__ import absolute_import
 
+import collections
 import os
+import threading
 import unittest
 
 import mock
+import psutil
 import pyfakefs.fake_filesystem_unittest
 
 import opencue_proto.host_pb2
@@ -37,6 +40,8 @@ import rqd.rqnetwork
 import rqd.rqnimby
 import rqd.rqutil
 
+
+CpuTimes = collections.namedtuple('CpuTimes', 'user system idle')
 
 CPUINFO = """processor	: 0
 vendor_id	: GenuineIntel
@@ -293,6 +298,114 @@ class MachineTests(pyfakefs.fake_filesystem_unittest.TestCase):
         self.loadavg.set_contents(LOADAVG_HIGH_USAGE)
 
         self.assertEqual(1019, self.machine.getLoadAvg())
+
+    def _getLoadAvgOn(self, system):
+        # The class patch of platform.system outranks one on a test method, so it is patched here.
+        with mock.patch('platform.system', new=mock.MagicMock(return_value=system)):
+            return self.machine.getLoadAvg()
+
+    @mock.patch('psutil.cpu_count', new=mock.MagicMock(return_value=96))
+    @mock.patch('psutil.cpu_times', new=mock.MagicMock(return_value=CpuTimes(50, 0, 50)))
+    @mock.patch.object(
+        rqd.rqmachine.Machine, '_Machine__enabledHT', new=mock.MagicMock(return_value=True))
+    @mock.patch.object(
+        rqd.rqmachine.Machine, 'getHyperthreadingMultiplier',
+        new=mock.MagicMock(return_value=2))
+    def test_getLoadAvgWindows_isTheBusyCoresDividedByTheHyperthreadingMultiplier(self):
+        # Half of 96 logical cores is 48 busy cores, 24 per hyperthreading pair, times 100.
+        self.assertEqual(2400, self._getLoadAvgOn('Windows'))
+
+    @mock.patch('psutil.cpu_count', new=mock.MagicMock(return_value=8))
+    @mock.patch('psutil.cpu_times', new=mock.MagicMock(return_value=CpuTimes(100, 0, 0)))
+    @mock.patch.object(
+        rqd.rqmachine.Machine, '_Machine__enabledHT', new=mock.MagicMock(return_value=False))
+    def test_getLoadAvgWindows_withoutHyperthreadingEveryLogicalCoreCounts(self):
+        self.assertEqual(800, self._getLoadAvgOn('Windows'))
+
+    @mock.patch('rqd.rqconstants.LOAD_MODIFIER', new=-300)
+    @mock.patch('psutil.cpu_count', new=mock.MagicMock(return_value=8))
+    @mock.patch('psutil.cpu_times')
+    @mock.patch.object(
+        rqd.rqmachine.Machine, '_Machine__enabledHT', new=mock.MagicMock(return_value=False))
+    def test_getLoadAvgWindows_addsTheConfiguredLoadModifierAndStaysAboveZero(
+            self, cpuTimesMock):
+        cpuTimesMock.return_value = CpuTimes(100, 0, 0)
+
+        self.assertEqual(500, self._getLoadAvgOn('Windows'))
+
+        self.machine._Machine__windowsLoadSample = None
+        cpuTimesMock.return_value = CpuTimes(125, 0, 75)
+
+        self.assertEqual(0, self._getLoadAvgOn('Windows'))
+
+    @mock.patch('psutil.cpu_count', new=mock.MagicMock(return_value=8))
+    @mock.patch('psutil.cpu_times')
+    def test_getLoadAvgWindows_isZeroWhenTheCpuCannotBeRead(self, cpuTimesMock):
+        for error in (OSError('denied'), psutil.Error('gone'), ValueError('bad')):
+            cpuTimesMock.side_effect = error
+
+            self.assertEqual(0, self._getLoadAvgOn('Windows'))
+
+    @mock.patch('psutil.cpu_count', new=mock.MagicMock(return_value=None))
+    @mock.patch('psutil.cpu_times', new=mock.MagicMock(return_value=CpuTimes(50, 0, 50)))
+    def test_getLoadAvgWindows_isZeroWhenTheCoreCountIsUnknown(self):
+        self.assertEqual(0, self._getLoadAvgOn('Windows'))
+
+    @mock.patch('time.monotonic')
+    @mock.patch('psutil.cpu_count', new=mock.MagicMock(return_value=8))
+    @mock.patch('psutil.cpu_times')
+    @mock.patch.object(
+        rqd.rqmachine.Machine, '_Machine__enabledHT', new=mock.MagicMock(return_value=False))
+    def test_getLoadAvgWindows_aReadingIsKeptSoThatReportsCloseTogetherAgree(
+            self, cpuTimesMock, monotonicMock):
+        # Cpu times that follow each other at once give a window too short to measure.
+        cpuTimesMock.side_effect = [CpuTimes(50, 0, 50), CpuTimes(75, 0, 125)]
+        interval = rqd.rqconstants.RQD_MIN_PING_INTERVAL_SEC
+
+        monotonicMock.return_value = 100.0
+        first = self._getLoadAvgOn('Windows')
+        monotonicMock.return_value = 100.0 + interval - 0.1
+        soonAfter = self._getLoadAvgOn('Windows')
+        monotonicMock.return_value = 100.0 + interval
+        later = self._getLoadAvgOn('Windows')
+
+        self.assertEqual((400, 400), (first, soonAfter))
+        self.assertEqual(200, later)
+        self.assertEqual(2, cpuTimesMock.call_count)
+
+    @mock.patch('time.monotonic')
+    @mock.patch('psutil.cpu_count', new=mock.MagicMock(return_value=8))
+    @mock.patch('psutil.cpu_times')
+    @mock.patch.object(
+        rqd.rqmachine.Machine, '_Machine__enabledHT', new=mock.MagicMock(return_value=False))
+    def test_getLoadAvgWindows_aReadingFromAnotherThreadStillCoversTheTimeSinceThePreviousOne(
+            self, cpuTimesMock, monotonicMock):
+        # Host reports come from a new thread each time, and psutil.cpu_percent keeps its
+        # previous times per thread, which makes every call from a new thread read 0.0.
+        cpuTimesMock.side_effect = [CpuTimes(50, 0, 50), CpuTimes(75, 0, 125)]
+        interval = rqd.rqconstants.RQD_MIN_PING_INTERVAL_SEC
+        monotonicMock.return_value = 100.0
+        self._getLoadAvgOn('Windows')
+        monotonicMock.return_value = 100.0 + interval
+        readings = []
+
+        thread = threading.Thread(target=lambda: readings.append(self._getLoadAvgOn('Windows')))
+        thread.start()
+        thread.join()
+
+        self.assertEqual([200], readings)
+
+    @mock.patch('time.monotonic', new=mock.MagicMock(return_value=100.0))
+    @mock.patch('psutil.cpu_count', new=mock.MagicMock(return_value=8))
+    @mock.patch('psutil.cpu_times')
+    def test_getLoadAvgWindows_aFailedReadingIsNotKept(self, cpuTimesMock):
+        cpuTimesMock.side_effect = [OSError('denied'), CpuTimes(50, 0, 50)]
+
+        self.assertEqual(0, self._getLoadAvgOn('Windows'))
+        self.assertEqual(400, self._getLoadAvgOn('Windows'))
+
+    def test_getLoadAvg_isZeroWhereItIsNotRead(self):
+        self.assertEqual(0, self._getLoadAvgOn('Darwin'))
 
     def test_getBootTime(self):
         self.procStat.set_contents(PROC_STAT)
